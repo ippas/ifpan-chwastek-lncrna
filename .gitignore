@@ -2,6 +2,15 @@
 /data/
 /results/
 
+analysis/lnc_anova_fdr.RDS
+        analysis/main-tmp.html
+        analysis/main-tmp_files/
+        analysis/main.Rmd
+        analysis/pc_anova_fdr.RDS
+*.RDS
+*.html
+/analysis/*_files/
+
 
 ########## R.gitignore ##########
 
