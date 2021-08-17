@@ -1,0 +1,376 @@
+---
+title: "ifpan-chwastek-lncrna"
+output:
+  html_document:
+    toc: yes
+
+date: "_Ostatnio sporządzony: `r format(Sys.time(), '%d %B, %Y %H:%M:%S')`_"
+
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0(
+        xfun::sans_ext(input), '-tmp.html'
+      ),
+      envir = globalenv()
+    )
+  })
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(cache = TRUE, include = FALSE, warning = FALSE)
+```
+
+```{r install_packages, eval=FALSE}
+install.packages('gplots')
+install.packages('rstatix')
+install.packages('kableExtra')
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# https://github.com/Bioconductor/bioconductor_docker/issues/22
+BiocManager::install("preprocessCore", configure.args="--disable-threading")
+```
+
+```{r}
+library(tidyverse)
+library(preprocessCore)
+library(gplots)
+library(RColorBrewer)
+library(rstatix)
+library(kableExtra)
+```
+
+```{r load_data}
+lncrna_fpkm_df <- 
+  read_tsv('data/rna-seq-paired-end-output/genes.fpkm_table.tsv') %>%
+  rename(gene_id = tracking_id)
+  
+
+feature_info <-
+  read_tsv(
+    'data/rna-seq-paired-end-output/Homo_sapiens_gtf.gtf',
+    col_type = 'cccddcccc',
+    col_names = c(
+      'chr', 'source', 'feature', 'start', 'end',
+      'score', 'strand', 'frame', 'attribute'
+    ),
+    comment = "#"
+  ) %>%
+  filter(feature == 'gene')
+
+feature_info <-
+  as_tibble(
+    str_match(
+      feature_info$attribute,
+      paste0(
+        "gene_id \"(ENSG\\d{11})\";",
+        " gene_version \"\\d+\";",
+        " gene_name \"([-\\.\\w]+)\";",
+        " gene_source \"\\w+\";",
+        " gene_biotype \"(\\w+)\";"
+      )
+    )
+  ) %>%
+  select(-V1) %>%
+  rename(gene_id = V2, gene_name = V3, biotype = V4)
+stopifnot(!anyNA(feature_info))
+
+
+sample_info <-
+  read_tsv(
+    "raw/2021-07-09-lista-próbek-sekwencjonowanie.csv",
+    col_names = c('id', 'patient_id', 'treatment')
+  ) %>%
+  mutate(disease = str_sub(id, end = 2))
+
+write_tsv(sample_info, 'data/sample-info.tsv')
+```
+
+```{r filter_data}
+.mean_in_row <- apply(
+  lncrna_fpkm_df %>% select(starts_with("HF"), starts_with("OA")),
+  1,
+  mean
+)
+
+lncrna_df <-
+  lncrna_fpkm_df %>% 
+  filter(.mean_in_row > 1) %>%
+  left_join(feature_info, by = 'gene_id') %>%
+  filter(biotype %in% c('protein_coding', 'lncRNA')) %>% 
+  relocate(gene_id, gene_name, biotype)
+```
+
+```{r}
+lncrna_data <- list('lnc_fpkm' = NULL, 'lnc_annot' = NULL, 'pc_fpkm' = NULL, 'pc_annot' = NULL)
+
+lncrna_data[['lnc_fpkm']] <-
+  lncrna_df %>%
+  filter(biotype == 'lncRNA') %>%
+  select(starts_with("HF"), starts_with("OA"))
+
+lncrna_data[['lnc_annot']] <-
+  lncrna_df %>% 
+  filter(biotype == 'lncRNA') %>%
+  select(-starts_with("HF"), -starts_with("OA"))
+
+lncrna_data[['pc_fpkm']] <-
+  lncrna_df %>%
+  filter(biotype == 'protein_coding') %>%
+  select(starts_with("HF"), starts_with("OA"))
+
+lncrna_data[['pc_annot']] <-
+  lncrna_df %>% 
+  filter(biotype == 'protein_coding') %>%
+  select(-starts_with("HF"), -starts_with("OA"))
+```
+
+```{r anova_preparation}
+lncrna_data[['anova_template']] <-
+    tibble(id = colnames(lncrna_data$lnc_fpkm)) %>%
+    left_join(sample_info, by = 'id') %>%
+    mutate(counts = -1)
+
+compute_anova <- function(x, fpkm_df, progress_bar = NULL) {
+  if (!is.na(progress_bar)) {
+    setTxtProgressBar(progress_bar, i)
+    i <<- i + 1
+  }
+  
+  fpkm_df %>%
+  left_join(as_tibble(x, rownames = 'id'), by = 'id') %>%
+  mutate(fpkm = value, .keep = 'unused') %>%
+  anova_test(
+      dv = fpkm,
+      wid = patient_id,
+      between = disease,
+      within = treatment
+  ) %>%
+  get_anova_table() %>%
+  data.frame() %>%
+  select(Effect, p) %>%
+  pivot_wider(names_from = Effect, values_from = p)
+}
+```
+
+```{r heatmap_preparation}
+print_anova_table <- function(anova_filtered) {
+    anova_filtered %>% 
+        kbl(digits = 3, caption = '') %>% 
+        kable_styling(bootstrap_options = c("bordered", "hover", "condensed")) %>% 
+        print
+}
+
+plot_anova_heatmap <- function(anova_filtered, data, row_v = TRUE) {
+    palette <- brewer.pal(11, "RdBu")
+    rdbu_ramp <- colorRampPalette(palette)
+    
+    treatments <- c('Ctrl', 'LPS', 'IFNg')
+    y_join_colors <- tibble(
+        treatment = treatments,
+        col_side = brewer.pal(length(treatments), 'Set1')
+    )
+    sample_info_heatmap <- 
+        sample_info %>% 
+        left_join(y_join_colors, by = 'treatment') %>%
+        mutate(lab_col = paste(id, disease, sep = ' · ')) %>% 
+        arrange(treatment, disease)
+    
+    genes_oi <- pull(anova_filtered, gene_id)
+    diseases_arranged <- pull(sample_info_heatmap, id)
+    
+    col_sep <- sample_info_heatmap %>% 
+        group_by(treatment) %>% 
+        mutate(sep = !duplicated(disease)) %>% 
+        pull(sep) %>% 
+        which
+    col_sep <- col_sep[-1] - 1
+    
+    heatmap.2(
+        x = data[genes_oi, diseases_arranged],
+        Rowv = row_v,
+        Colv = FALSE,
+        dendrogram = 'row',
+        distfun = function(x) as.dist(1-cor(t(x))),
+        
+        scale = "row",
+        # breaks = seq(-3, 3, 0.25),
+        col = rev(rdbu_ramp(24)),
+        
+        colsep = col_sep,
+        sepcolor = 'white',
+        sepwidth = c(0.2, 0.2),
+        trace = "none",
+        
+        ColSideColors = sample_info_heatmap$col_side,
+        
+        margins = c(7, 12),
+        lwid = c(1.2, 9),
+        lhei = c(1.5, 8),
+        labRow = pull(anova_filtered, gene_name),
+        labCol = pull(sample_info_heatmap, lab_col),
+        srtCol = 90,
+        cexRow = 1.4,
+        cexCol = 1,
+        offsetRow = 0,
+        offsetCol = 0,
+    ) -> h
+    invisible(h)
+}
+```
+
+- **<span style='color: #E41A1C'>pasek czerwony</span>**: Ctrl
+- **<span style='color: #377EB8'>pasek niebieski</span>**: LPS
+- **<span style='color: #4DAF4A'>pasek zielony</span>**: IFNg
+
+# Long non-coding
+
+```{r anova_lnc, eval=FALSE}
+i <- 1
+pb <- txtProgressBar(min = 0, max = dim(lncrna_data[['lnc_fpkm']])[1], style = 3)
+lnc_anova <- apply(
+    lncrna_data[['lnc_fpkm']],
+    1,
+    compute_anova,
+    fpkm_df = lncrna_data[['anova_template']],
+    progress_bar = pb
+)
+lnc_anova <- bind_rows(lnc_anova)
+
+lnc_anova_fdr <- 
+  lnc_anova %>% 
+  bind_cols(lncrna_data[['lnc_annot']]) %>%
+  mutate(
+    across(
+      c(disease, treatment, `disease:treatment`),
+      list(fdr = p.adjust),
+      method = 'fdr')
+  ) %>%
+  relocate(disease, treatment, `disease:treatment`, .after = last_col()) %>%
+  relocate(disease_fdr, treatment_fdr, `disease:treatment_fdr`, .after = last_col())
+
+saveRDS(lnc_anova_fdr, 'analysis/lnc_anova_fdr.RDS')
+```
+
+```{r save_lnc_norm_log}
+lnc_anova_fdr <- readRDS('analysis/lnc_anova_fdr.RDS')
+
+bind_cols(lncrna_data$lnc_annot, lncrna_data$lnc_fpkm) %>% 
+  write_tsv('data/long-non-coding-fpkm-cuff.tsv')
+write_tsv(lnc_anova_fdr, 'data/long-non-coding-anova-fdr.tsv')
+```
+
+## disease: HF, OA
+```{r heatmap_anova_disease_lnc, echo=FALSE, fig.align="center", fig.height=10, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+.lnc_fpkms <- data.matrix(lncrna_data[['lnc_fpkm']])
+rownames(.lnc_fpkms) <- lncrna_data[['lnc_annot']]$gene_id
+
+anova_filtered <-
+  slice_min(lnc_anova_fdr, disease, n = 20)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, .lnc_fpkms)
+```
+
+## treatment: Ctrl, LPS, IFNg
+```{r heatmap_anova_treatment_lnc, echo=FALSE, fig.align="center", fig.height=10, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(lnc_anova_fdr, treatment, n = 40)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, .lnc_fpkms)
+```
+
+## interaction
+```{r heatmap_anova_interaction_lnc, echo=FALSE, fig.align="center", fig.height=8, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(lnc_anova_fdr, `disease:treatment`, n = 10)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, .lnc_fpkms)
+```
+
+```{bash copy_results_lnc, eval=FALSE}
+cp data/long-non-coding-fpkm-cuff.tsv results/
+cp data/long-non-coding-anova-fdr.tsv results/
+```
+
+
+# Protein coding
+
+```{r anova_pc, eval=FALSE}
+i <- 1
+pb <- txtProgressBar(min = 0, max = dim(lncrna_data[['pc_fpkm']])[1], style = 3)
+pc_anova <- apply(
+    lncrna_data[['pc_fpkm']],
+    1,
+    compute_anova,
+    fpkm_df = lncrna_data[['anova_template']],
+    progress_bar = pb
+)
+pc_anova <- bind_rows(pc_anova)
+
+pc_anova_fdr <- 
+  pc_anova %>% 
+  bind_cols(lncrna_data[['pc_annot']]) %>%
+  mutate(
+    across(
+      c(disease, treatment, `disease:treatment`),
+      list(fdr = p.adjust),
+      method = 'fdr')
+  ) %>%
+  relocate(disease, treatment, `disease:treatment`, .after = last_col()) %>%
+  relocate(disease_fdr, treatment_fdr, `disease:treatment_fdr`, .after = last_col())
+
+saveRDS(pc_anova_fdr, 'analysis/pc_anova_fdr.RDS')
+```
+
+```{r save_pc_norm_log}
+pc_anova_fdr <- readRDS('analysis/pc_anova_fdr.RDS')
+
+bind_cols(lncrna_data$pc_annot, lncrna_data$pc_fpkm) %>% 
+  write_tsv('data/protein-coding-fpkm-cuff.tsv')
+write_tsv(pc_anova_fdr, 'data/protein-coding-anova-fdr.tsv')
+```
+
+## disease: HF, OA
+```{r heatmap_anova_disease_pc, echo=FALSE, fig.align="center", fig.height=10, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+.pc_fpkms <- data.matrix(lncrna_data[['pc_fpkm']])
+rownames(.pc_fpkms) <- lncrna_data[['pc_annot']]$gene_id
+
+anova_filtered <-
+  slice_min(pc_anova_fdr, disease, n = 20)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, .pc_fpkms)
+```
+
+## treatment: Ctrl, LPS, IFNg
+```{r heatmap_anova_treatment_pc, echo=FALSE, fig.align="center", fig.height=10, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(pc_anova_fdr, treatment, n = 40)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, .pc_fpkms)
+```
+
+## interaction
+```{r heatmap_anova_interaction_pc, echo=FALSE, fig.align="center", fig.height=8, fig.width=13, results='asis', include=TRUE, warning=FALSE, cache=FALSE}
+anova_filtered <-
+  slice_min(pc_anova_fdr, `disease:treatment`, n = 10)
+  
+print_anova_table(anova_filtered)
+plot_anova_heatmap(anova_filtered, .pc_fpkms)
+```
+
+```{bash copy_results_pc, eval=FALSE}
+cp data/protein-coding-fpkm-cuff.tsv results/
+cp data/protein-coding-anova-fdr.tsv results/
+```
+
+```{bash copy_results_report, eval=FALSE}
+cp analysis/main-tmp.html results/main.html
+```
