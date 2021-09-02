@@ -1,6 +1,6 @@
 {
     "rna_seq_paired_end.analysis_id": "H201SC21060946",
-    "rna_seq_paired_end.input_organism_name": "Homo sapiens",
+    "rna_seq_paired_end.organism_name": "Homo sapiens",
     "rna_seq_paired_end.release_version": "100",
     "rna_seq_paired_end.fastqs_left": [
         "/home/ifpan/projects/ifpan-chwastek-lncrna/raw/X201SC21060946-Z01-F002/HF011/HF011_1.fq.gz",
